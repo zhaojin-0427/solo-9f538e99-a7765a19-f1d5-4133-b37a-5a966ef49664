@@ -35,6 +35,68 @@ CREATE TABLE IF NOT EXISTS migration_state (
 )
 """
 
+# Issued quality-control batches are append-only.  ``issuance_items`` stores the
+# exact wide-table readings that were checked, so later legacy corrections can
+# never change what a batch says was issued.
+ISSUANCE_BATCHES_SQL = """
+CREATE TABLE IF NOT EXISTS issuance_batches (
+    batch_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT    NOT NULL,
+    temperature_min REAL    NOT NULL,
+    temperature_max REAL    NOT NULL,
+    ph_min          REAL    NOT NULL,
+    ph_max          REAL    NOT NULL,
+    sample_count    INTEGER NOT NULL CHECK (sample_count > 0),
+    source          TEXT    NOT NULL,
+    CHECK (temperature_min <= temperature_max),
+    CHECK (ph_min <= ph_max)
+)
+"""
+
+ISSUANCE_ITEMS_SQL = """
+CREATE TABLE IF NOT EXISTS issuance_items (
+    batch_id    INTEGER NOT NULL REFERENCES issuance_batches(batch_id),
+    sample_id   INTEGER NOT NULL,
+    temperature REAL    NOT NULL,
+    ph          REAL    NOT NULL,
+    PRIMARY KEY (batch_id, sample_id)
+) WITHOUT ROWID
+"""
+
+# Enforce append-only at the storage level as well as in the API: a batch (and
+# its snapshotted readings) can never be edited or deleted.  INSERT OR REPLACE
+# is also blocked because REPLACE deletes the old row first.
+ISSUANCE_IMMUTABLE_TRIGGER_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS issuance_batches_no_update
+    BEFORE UPDATE ON issuance_batches
+    BEGIN
+        SELECT RAISE(ABORT, 'issued batches are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS issuance_batches_no_delete
+    BEFORE DELETE ON issuance_batches
+    BEGIN
+        SELECT RAISE(ABORT, 'issued batches are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS issuance_items_no_update
+    BEFORE UPDATE ON issuance_items
+    BEGIN
+        SELECT RAISE(ABORT, 'issued batch items are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS issuance_items_no_delete
+    BEFORE DELETE ON issuance_items
+    BEGIN
+        SELECT RAISE(ABORT, 'issued batch items are immutable');
+    END
+    """,
+)
+
 MIGRATION_EVENT_SQL = """
 CREATE TABLE IF NOT EXISTS migration_events (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,11 +254,31 @@ CREATE TABLE samples (
 
 
 def create_base_schema(conn) -> None:
-    """Create long storage and migration bookkeeping (idempotent)."""
+    """Create long storage, issuance storage and bookkeeping (idempotent)."""
     conn.execute(LONG_TABLE_SQL)
     conn.execute(MIGRATION_TABLE_SQL)
     conn.execute(MIGRATION_EVENT_SQL)
     conn.execute(INSERT_CONTEXT_SQL)
+    conn.execute(ISSUANCE_BATCHES_SQL)
+    conn.execute(ISSUANCE_ITEMS_SQL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_issuance_items_sample"
+        " ON issuance_items(sample_id)"
+    )
+    for sql in ISSUANCE_IMMUTABLE_TRIGGER_SQL:
+        conn.execute(sql)
+
+
+def create_issuance_schema(conn) -> None:
+    """Create the issuance tables for code paths that may run before startup."""
+    conn.execute(ISSUANCE_BATCHES_SQL)
+    conn.execute(ISSUANCE_ITEMS_SQL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_issuance_items_sample"
+        " ON issuance_items(sample_id)"
+    )
+    for sql in ISSUANCE_IMMUTABLE_TRIGGER_SQL:
+        conn.execute(sql)
 
 
 def ensure_wide_table(conn) -> None:

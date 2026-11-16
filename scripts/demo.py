@@ -24,8 +24,10 @@ if str(ROOT) not in sys.path:
 import legacy.acquisition as legacy
 
 
-def call(method: str, url: str) -> tuple[int, dict]:
-    req = urllib.request.Request(url, method=method)
+def call(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read())
@@ -124,6 +126,39 @@ def main() -> int:
     print(
         f"   HTTP {status} action={body['action']} state={body['migration']['state']}"
     )
+
+    print("7) quality-control issuance after cutover")
+    ranges = {
+        "temperature": {"min": 30.0, "max": 42.0},
+        "ph": {"min": 6.0, "max": 8.0},
+    }
+    bad_status, bad = call(
+        "POST",
+        f"{args.api}/issuances",
+        {"sample_ids": [1, 4, 999], **ranges},
+    )
+    print(f"   rejected sample(s): HTTP {bad_status} {json.dumps(bad, ensure_ascii=False)[:200]}")
+
+    status, body = call(
+        "POST",
+        f"{args.api}/issuances",
+        {"sample_ids": [1, 2, 3, 43], **ranges},
+    )
+    print(f"   issue -> HTTP {status} {json.dumps(body, ensure_ascii=False)[:200]}")
+    if status != 201:
+        return 1
+    batch_id = body["batch"]["batch_id"]
+
+    # A later legacy correction must not change the issued snapshot.
+    conn = legacy.open_db(db)
+    try:
+        legacy.update(conn, 1, temperature=41.75)
+    finally:
+        conn.close()
+    _, snapshot = call("GET", f"{args.api}/issuances/{batch_id}/items?limit=10")
+    _, current = call("GET", f"{args.api}/samples/1/metrics")
+    print(f"   snapshot after correction: {json.dumps(snapshot['items'], ensure_ascii=False)}")
+    print(f"   current value: {json.dumps(current, ensure_ascii=False)}")
     return 0
 
 
